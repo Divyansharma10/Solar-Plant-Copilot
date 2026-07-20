@@ -49,7 +49,7 @@ Create and activate a virtual environment, then install the required packages.
 ```powershell
 python -m venv venv
 .\venv\Scripts\Activate.ps1
-pip install streamlit pandas numpy plotly requests python-dotenv geopy pvlib scipy statsmodels ollama faiss-cpu langchain-groq langchain-core langchain-community langchain-huggingface langchain-classic
+pip install -r requirements.txt
 ```
 
 If you already have the environment set up, install only the missing packages.
