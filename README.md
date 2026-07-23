@@ -100,6 +100,44 @@ streamlit run app.py
 
 Then choose a zone, choose a window, and click Run Analysis.
 
+## Data Modes
+
+The sidebar supports two read-only data modes:
+
+- **Historical** uses the generated 2020-2024 CSV files and saved windows.
+- **Live Demo** fetches recent hourly weather from Open-Meteo, simulates zone
+  output with the existing PV model, validates freshness and schema quality,
+  and runs the same anomaly, RAG, and reasoning pipeline.
+
+Live Demo is not actual plant telemetry. It is an integration test for the
+vendor-neutral telemetry contract in `telemetry.py`. A future SCADA, MQTT,
+OPC-UA, database, or inverter adapter should produce the same core fields:
+
+- `time`, `zone`, `ac_power_kw`, `dc_power_kw`
+- `global_tilted_irradiance`, `temperature_2m`, `cell_temperature`
+- `inverter_id`, `inverter_status`, `grid_available`
+- optional `battery_soc_pct` and `alarm_code`
+
+The live adapter retries transient API failures, rejects invalid schemas and
+out-of-range values, reports feed freshness, and retains Historical mode when
+the external feed is unavailable.
+
+## Operator Decision Rules
+
+`recommendation_engine.py` converts deterministic anomaly evidence into
+auditable operator decisions. Every triggered rule includes a stable rule ID,
+severity, measured evidence, required action, urgency, and clearing condition.
+The cloud LLM may explain these decisions but is instructed not to replace the
+primary rule's action or urgency.
+
+Current rule families cover data completeness, stuck sensors, physical
+underperformance, strong-sun output deficits, inverter clipping, weather-driven
+reductions, and sustained grid-minimum risk. Run the durable rule tests with:
+
+```bash
+python -m unittest tests/test_recommendation_engine.py
+```
+
 ## Notes
 
 - The edge summarizer in `edge_llm.py` uses `ollama.chat`, so Ollama must be running locally for that step to work.

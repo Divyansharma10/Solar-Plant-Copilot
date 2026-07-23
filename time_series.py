@@ -12,7 +12,7 @@ from statsmodels.tsa.arima.model import ARIMA
 from config import (
     WINDOW_SIZE_HOURS, STEP_SIZE_HOURS,
     SEASON_MAP, MONTH_NAMES, DATA_DIR,
-    WINDOW_SUMMARIES_CSV
+    WINDOW_SUMMARIES_CSV, ALL_ZONES_WINDOW_SUMMARIES_CSV, ZONES
 )
 
 
@@ -224,13 +224,20 @@ if __name__ == "__main__":
     print("Loading output dataset...")
     output_df = pd.read_csv(OUTPUT_CSV)
 
-    hourly_avg, summaries_df, fft_df, arma_model = run_time_series_analysis(
-        output_df,
-        zone_name="Zone_A",
-        run_fft_analysis=True,
-        run_arma_analysis=True,
-        save=True
-    )
+    all_summaries = []
+    for zone_name in ZONES:
+        hourly_avg, summaries_df, fft_df, arma_model = run_time_series_analysis(
+            output_df,
+            zone_name=zone_name,
+            run_fft_analysis=(zone_name == "Zone_A"),
+            run_arma_analysis=(zone_name == "Zone_A"),
+            save=(zone_name == "Zone_A")
+        )
+        all_summaries.append(summaries_df)
+
+    summaries_df = pd.concat(all_summaries, ignore_index=True)
+    summaries_df.to_csv(ALL_ZONES_WINDOW_SUMMARIES_CSV, index=False)
+    print(f"Saved -> {ALL_ZONES_WINDOW_SUMMARIES_CSV}")
 
     print("\nTime series analysis complete.")
     print(summaries_df.head())

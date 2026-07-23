@@ -244,7 +244,15 @@ def setup_rag(summaries_df, embeddings=None, load_existing=False):
     seasonal_lookup = build_seasonal_lookup(seasonal_docs)
 
     if load_existing:
-        vectorstore = load_index(embeddings)
+        try:
+            vectorstore = load_index(embeddings)
+        except Exception as exc:
+            print(
+                "Existing FAISS index unavailable; rebuilding it "
+                f"({type(exc).__name__})."
+            )
+            vectorstore = FAISS.from_documents(all_docs, embeddings)
+            vectorstore.save_local(FAISS_INDEX_PATH)
         bm25_retriever = BM25Retriever.from_documents(all_docs)
         bm25_retriever.k = RAG_TOP_K
         faiss_retriever = vectorstore.as_retriever(
@@ -263,10 +271,10 @@ def setup_rag(summaries_df, embeddings=None, load_existing=False):
 
 if __name__ == "__main__":
     import pandas as pd
-    from config import WINDOW_SUMMARIES_CSV
+    from config import ALL_ZONES_WINDOW_SUMMARIES_CSV
 
     print("Loading window summaries...")
-    summaries_df = pd.read_csv(WINDOW_SUMMARIES_CSV)
+    summaries_df = pd.read_csv(ALL_ZONES_WINDOW_SUMMARIES_CSV)
 
     embeddings = load_embeddings()
     hybrid_retriever, seasonal_lookup, _ = setup_rag(

@@ -7,6 +7,7 @@ Dashboard + embedded chat interface for solar plant operators.
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+import os
 from datetime import datetime
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage
@@ -21,6 +22,7 @@ from pipeline import (
     build_llmsense_prompt, get_cloud_reasoning,
     run_pipeline, load_cloud_llm
 )
+from telemetry import fetch_live_demo, build_live_summary
 
 # ── Page Config ────────────────────────────────────────────────
 st.set_page_config(
@@ -33,6 +35,17 @@ st.set_page_config(
 @st.cache_resource
 def load_resources():
     """Load all heavy resources once and cache them."""
+    required_files = [
+        OUTPUT_CSV,
+        f"{DATA_DIR}/all_zones_window_summaries.csv"
+    ]
+    missing_files = [path for path in required_files if not os.path.exists(path)]
+    if missing_files:
+        raise FileNotFoundError(
+            "Missing generated data: " + ", ".join(missing_files) +
+            ". Run data_extraction.py, preprocessing.py, and time_series.py."
+        )
+
     daylight_df = pd.read_csv(OUTPUT_CSV)
     summaries_df = pd.read_csv(f"{DATA_DIR}/all_zones_window_summaries.csv")
     summaries_df["month"] = pd.to_datetime(
@@ -48,6 +61,12 @@ def load_resources():
     )
     llm = load_cloud_llm()
     return daylight_df, summaries_df, hybrid_retriever, seasonal_lookup, llm
+
+
+@st.cache_data(ttl=900)
+def load_live_demo(zone_name):
+    """Cache live-demo telemetry briefly to limit external API traffic."""
+    return fetch_live_demo(zone_name)
 
 
 # ── Helper: Parse Reasoning Output ────────────────────────────
@@ -185,13 +204,36 @@ def main():
     st.caption("Jaipur, Rajasthan, India — LLMSense + RAG Powered")
 
     # Load resources
-    with st.spinner("Loading models and data..."):
-        daylight_df, summaries_df, hybrid_retriever, seasonal_lookup, llm = \
-            load_resources()
+    try:
+        with st.spinner("Loading models and data..."):
+            daylight_df, summaries_df, hybrid_retriever, seasonal_lookup, llm = \
+                load_resources()
+    except FileNotFoundError as exc:
+        st.error(f"Data setup incomplete: {exc}")
+        st.code(
+            "python data_extraction.py\n"
+            "python preprocessing.py\n"
+            "python time_series.py\n"
+            "python rag.py"
+        )
+        st.stop()
+    except Exception as exc:
+        st.error(
+            "Resource initialization failed. Check the generated data and "
+            f"embedding model, then restart the app. ({type(exc).__name__}: {exc})"
+        )
+        st.stop()
 
     # ── Sidebar ────────────────────────────────────────────────
     with st.sidebar:
         st.header("⚙️ Controls")
+
+        data_mode = st.radio(
+            "Data Source",
+            options=["Historical", "Live Demo"],
+            index=0,
+            help="Live Demo uses current Open-Meteo weather and simulated output."
+        )
 
         # Zone selector
         zone_name = st.selectbox(
@@ -200,32 +242,49 @@ def main():
             index=0
         )
 
-        # Window selector
-        window_mode = st.radio(
-            "Window Mode",
-            options=["Latest (most recent 7 days)", "Historical"],
-            index=0
-        )
+        if data_mode == "Historical":
+            # Window indexes are zone-relative.
+            zone_summaries = summaries_df[
+                summaries_df["zone"] == zone_name
+            ].reset_index(drop=True)
 
-        if window_mode == "Historical":
-            window_index = st.slider(
-                "Window Index",
-                min_value=0,
-                max_value=len(summaries_df) - 1,
-                value=len(summaries_df) - 1,
-                help="0 = Jan 2020, latest = Dec 2024"
+            if zone_summaries.empty:
+                st.error(f"No window summaries found for {zone_name}.")
+                st.stop()
+
+            window_mode = st.radio(
+                "Window Mode",
+                options=["Latest (most recent 7 days)", "Historical"],
+                index=0
             )
-            selected_window = summaries_df.iloc[window_index]
-            st.caption(
-                f"📅 {selected_window['window_start'][:10]} → "
-                f"{selected_window['window_end'][:10]}"
-            )
+
+            if window_mode == "Historical":
+                window_index = st.slider(
+                    "Window Index",
+                    min_value=0,
+                    max_value=len(zone_summaries) - 1,
+                    value=len(zone_summaries) - 1,
+                    help="0 = Jan 2020, latest = Dec 2024"
+                )
+                selected_window = zone_summaries.iloc[window_index]
+                st.caption(
+                    f"📅 {selected_window['window_start'][:10]} → "
+                    f"{selected_window['window_end'][:10]}"
+                )
+            else:
+                window_index = len(zone_summaries) - 1
+            button_label = "🔍 Run Analysis"
         else:
-            window_index = len(summaries_df) - 1
+            zone_summaries = None
+            window_index = 0
+            st.caption(
+                "🟢 Read-only demo feed · current weather · simulated plant output"
+            )
+            button_label = "🔄 Refresh Live Analysis"
 
         # Run button
         run_analysis = st.button(
-            "🔍 Run Analysis",
+            button_label,
             type="primary",
             use_container_width=True
         )
@@ -243,33 +302,88 @@ def main():
         st.session_state.last_zone = None
     if "last_window" not in st.session_state:
         st.session_state.last_window = None
+    if "last_mode" not in st.session_state:
+        st.session_state.last_mode = None
 
     # ── Run Pipeline ───────────────────────────────────────────
-    if run_analysis or (
-        st.session_state.result is None
-    ):
-        with st.spinner("Running LLMSense pipeline..."):
-            result = run_pipeline(
-                zone_name=zone_name,
-                window_index=window_index,
-                summaries_df=summaries_df,
-                daylight_df=daylight_df,
-                hybrid_retriever=hybrid_retriever,
-                seasonal_lookup=seasonal_lookup,
-                llm=llm
+    should_run = (
+        run_analysis or st.session_state.result is None or
+        st.session_state.last_zone != zone_name or
+        st.session_state.last_mode != data_mode
+    )
+    if should_run:
+        try:
+            with st.spinner("Running LLMSense pipeline..."):
+                if data_mode == "Live Demo":
+                    if run_analysis:
+                        load_live_demo.clear()
+                    analysis_df, telemetry_quality = load_live_demo(zone_name)
+                    analysis_summaries = build_live_summary(
+                        analysis_df, daylight_df, zone_name
+                    )
+                    result = run_pipeline(
+                        zone_name=zone_name,
+                        window_index=0,
+                        summaries_df=analysis_summaries,
+                        daylight_df=analysis_df,
+                        hybrid_retriever=hybrid_retriever,
+                        seasonal_lookup=seasonal_lookup,
+                        llm=llm,
+                        historical_df=daylight_df
+                    )
+                    result["telemetry_quality"] = telemetry_quality
+                    result["telemetry_data"] = analysis_df
+                else:
+                    result = run_pipeline(
+                        zone_name=zone_name,
+                        window_index=window_index,
+                        summaries_df=zone_summaries,
+                        daylight_df=daylight_df,
+                        hybrid_retriever=hybrid_retriever,
+                        seasonal_lookup=seasonal_lookup,
+                        llm=llm
+                    )
+                if result:
+                    result["data_mode"] = data_mode
+                    st.session_state.result = result
+                    st.session_state.last_zone = zone_name
+                    st.session_state.last_window = window_index
+                    st.session_state.last_mode = data_mode
+                    st.session_state.chat_history = []
+        except Exception as exc:
+            st.error(
+                "Live telemetry could not be prepared. Historical mode remains "
+                f"available. ({type(exc).__name__}: {exc})"
             )
-            if result:
-                st.session_state.result = result
-                st.session_state.last_zone = zone_name
-                st.session_state.last_window = window_index
-                # Clear chat on new analysis
-                st.session_state.chat_history = []
+            if st.session_state.result is None:
+                return
 
     result = st.session_state.result
 
     if result is None:
         st.warning("No analysis yet. Click Run Analysis.")
         return
+
+    for warning in result.get("warnings", []):
+        st.warning(warning)
+
+    quality = result.get("telemetry_quality")
+    if quality:
+        freshness = (
+            f"Fresh · {quality['age_hours']:.1f}h old"
+            if quality["fresh"] else
+            f"Stale · {quality['age_hours']:.1f}h old"
+        )
+        if quality["valid"] and quality["fresh"]:
+            st.success(
+                f"Live demo telemetry: {freshness} · "
+                f"latest {quality['latest_timestamp']}"
+            )
+        else:
+            st.warning(
+                f"Live demo telemetry quality: {freshness}. " +
+                ("; ".join(quality["errors"]) or "No schema errors.")
+            )
 
     # Parse reasoning into structured fields
     fields = parse_reasoning(result["reasoning"])
@@ -312,11 +426,19 @@ def main():
         )
 
     # Output trend chart
-    window_stats = summaries_df.iloc[window_index].to_dict()
-    window_start = pd.to_datetime(window_stats["window_start"])
-    window_end = pd.to_datetime(window_stats["window_end"])
+    window_stats = {
+        "window_start": result["window_start"],
+        "window_end": result["window_end"],
+        "daytime_avg_kw": result["actual_output_kw"],
+        "season": result["season"]
+    }
+    window_start = pd.to_datetime(result["window_start"])
+    window_end = pd.to_datetime(result["window_end"])
 
-    zone_data = daylight_df[daylight_df["zone"] == zone_name].copy()
+    if result.get("data_mode") == "Live Demo":
+        zone_data = result["telemetry_data"].copy()
+    else:
+        zone_data = daylight_df[daylight_df["zone"] == result["zone"]].copy()
     zone_data["time"] = pd.to_datetime(zone_data["time"])
     window_data = zone_data[
         (zone_data["time"] >= window_start) &
@@ -325,11 +447,59 @@ def main():
 
     if not window_data.empty:
         st.plotly_chart(
-            plot_output_trend(window_data, zone_name),
+            plot_output_trend(window_data, result["zone"]),
             use_container_width=True
         )
 
     st.divider()
+
+    # ── Deterministic anomaly evidence ──────────────────────────
+    anomaly = result.get("anomaly_analysis")
+    if anomaly:
+        st.subheader("🔬 Deterministic Health Checks")
+        health1, health2, health3, health4 = st.columns(4)
+        with health1:
+            st.metric("Performance Ratio", f"{anomaly['performance_ratio_pct']:.1f}%")
+        with health2:
+            st.metric("Physical Model", f"{anomaly['model_performance_pct']:.1f}%")
+        with health3:
+            st.metric("Rolling Baseline", f"{anomaly['rolling_baseline_pct']:.1f}%")
+        with health4:
+            st.metric("Likely Cause", anomaly["cause"])
+
+        for evidence in anomaly["evidence"]:
+            st.caption(f"• {evidence}")
+
+        st.divider()
+
+    # ── Auditable operator decision rules ───────────────────────
+    decision = result.get("recommendation_analysis")
+    if decision:
+        st.subheader("🧭 Operator Decision Rules")
+        primary_message = (
+            f"{decision['primary_rule_id']} · {decision['severity']} · "
+            f"{decision['action']} Urgency: {decision['urgency']}."
+        )
+        if decision["severity"] == "Critical":
+            st.error(primary_message)
+        elif decision["severity"] == "Warning":
+            st.warning(primary_message)
+        elif decision["severity"] == "Monitor":
+            st.info(primary_message)
+        else:
+            st.success(primary_message)
+
+        with st.expander("View triggered rules and clearing conditions"):
+            rule_rows = [{
+                "Rule": rule["rule_id"],
+                "Severity": rule["severity"],
+                "Evidence": rule["evidence"],
+                "Action": rule["action"],
+                "Clear condition": rule["clear_condition"]
+            } for rule in decision["triggered_rules"]]
+            st.dataframe(rule_rows, hide_index=True, width="stretch")
+
+        st.divider()
 
     # ── MIDDLE — Copilot Analysis ──────────────────────────────
     st.subheader("🤖 Copilot Analysis")
@@ -361,6 +531,9 @@ def main():
     # ── BOTTOM — Chat Interface ────────────────────────────────
     st.subheader("💬 Ask the Copilot")
 
+    if llm is None:
+        st.info("Chat is disabled until GROQ_API_KEY is configured.")
+
     # Display chat history
     for message in st.session_state.chat_history:
         with st.chat_message(message["role"]):
@@ -368,7 +541,8 @@ def main():
 
     # Chat input
     user_input = st.chat_input(
-        "Ask about plant performance, anomalies, recommendations..."
+        "Ask about plant performance, anomalies, recommendations...",
+        disabled=llm is None
     )
 
     if user_input:
@@ -384,16 +558,22 @@ def main():
         # Get Copilot response
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                response = get_chat_response(
-                    user_question=user_input,
-                    current_reasoning=result["reasoning"],
-                    window_stats={
-                        **window_stats,
-                        "season": result["season"]
-                    },
-                    zone_name=zone_name,
-                    llm=llm
-                )
+                try:
+                    response = get_chat_response(
+                        user_question=user_input,
+                        current_reasoning=result["reasoning"],
+                        window_stats={
+                            **window_stats,
+                            "season": result["season"]
+                        },
+                        zone_name=result["zone"],
+                        llm=llm
+                    )
+                except Exception as exc:
+                    response = (
+                        "Chat is temporarily unavailable. The dashboard "
+                        f"analysis remains valid. ({type(exc).__name__})"
+                    )
             st.write(response)
 
         # Add assistant response to history
