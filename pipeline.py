@@ -18,15 +18,25 @@ from config import (
 )
 from edge_llm import format_window_for_summary, get_local_summary
 from rag import get_rag_context, build_rag_query
+from anomaly_detection import analyze_window, format_anomaly_context
+from recommendation_engine import (
+    evaluate_recommendations, format_recommendation_context
+)
 
 
 # ── Cloud LLM Setup ────────────────────────────────────────────
 def load_cloud_llm():
-    """Initialize LangChain ChatGroq cloud LLM."""
+    """Initialize ChatGroq, or return None when cloud mode is unconfigured."""
+    if not GROQ_API_KEY:
+        print("Cloud LLM disabled: GROQ_API_KEY is not configured.")
+        return None
+
     llm = ChatGroq(
         api_key=GROQ_API_KEY,
         model_name=CLOUD_LLM_MODEL,
-        temperature=CLOUD_LLM_TEMPERATURE
+        temperature=CLOUD_LLM_TEMPERATURE,
+        timeout=30,
+        max_retries=2
     )
     print(f"Cloud LLM loaded: {CLOUD_LLM_MODEL}")
     return llm
@@ -38,7 +48,9 @@ def build_llmsense_prompt(
     window_stats,
     zone_name,
     rag_context,
-    expected_output_kw
+    expected_output_kw,
+    anomaly_context="",
+    recommendation_context=""
 ):
     """
     Build the full LLMSense prompt following:
@@ -71,7 +83,7 @@ Plant Information:
 - Grid Contract Minimum: {GRID_CONTRACT_MIN_KW} kW during daylight hours
 - Battery Reserve Threshold: Activate if output expected below \
 {BATTERY_RESERVE_THRESHOLD_KW} kW for >{BATTERY_RESERVE_DURATION_HOURS} hours
-- Normal Performance Ratio: {NORMAL_PR_MIN} - {NORMAL_PR_MAX}
+- Normal Performance Ratio: {NORMAL_PR_MIN * 100:.0f}% - {NORMAL_PR_MAX * 100:.0f}%
 - Season context: Jaipur receives peak irradiance in March-April,
   lowest in December-January, monsoon cloud disruption June-September
 """
@@ -94,6 +106,14 @@ Statistical Summary (7-day sliding window):
 - Residual std deviation: {window_stats['residual_std']} kW
 - Maximum single-hour deviation: {window_stats['abs_max_deviation_kw']} kW
 - Residual mean vs seasonal norm: {window_stats['residual_mean']} kW
+
+Deterministic Anomaly Engine (treat this measured evidence as authoritative):
+{anomaly_context}
+
+Deterministic Operator Rules (authoritative):
+{recommendation_context}
+Do not invent a different action or urgency. The RECOMMENDATION and URGENCY
+fields must preserve the primary rule's action and urgency exactly.
 
 Performance Assessment Guide:
 - Above {PERFORMANCE_NORMAL}%: Normal — plant performing well
@@ -140,6 +160,46 @@ def get_cloud_reasoning(prompt, llm, max_tokens=600):
     return response.content
 
 
+def build_fallback_reasoning(
+    window_stats, expected_output_kw, recommendation_analysis=None
+):
+    """Create an auditable rules-only assessment when cloud AI is unavailable."""
+    actual = float(window_stats["daytime_avg_kw"])
+    expected = float(expected_output_kw)
+    performance = round((actual / expected) * 100, 1) if expected else 0.0
+
+    if performance >= PERFORMANCE_NORMAL:
+        status, urgency = "Normal", "None"
+        anomaly = "None detected"
+        recommendation = "No action required"
+    elif performance >= PERFORMANCE_MONITOR:
+        status, urgency = "Monitor", "Monitor"
+        anomaly = f"Output is {expected - actual:.1f} kW below expectation"
+        recommendation = "Continue monitoring; investigate if performance declines"
+    elif performance >= PERFORMANCE_WARNING:
+        status, urgency = "Warning", "Within 1 hour"
+        anomaly = f"Output is {expected - actual:.1f} kW below expectation"
+        recommendation = "Check irradiance sensors, inverter status, and grid availability"
+    else:
+        status, urgency = "Critical", "Immediate"
+        anomaly = f"Output is {expected - actual:.1f} kW below expectation"
+        recommendation = "Inspect inverter alarms, plant availability, and grid connection"
+
+    if recommendation_analysis:
+        recommendation = recommendation_analysis["action"]
+        urgency = recommendation_analysis["urgency"]
+
+    return f"""STATUS: {status}
+PERFORMANCE: {actual:.1f} kW vs {expected:.1f} kW = {performance:.1f}%
+ANOMALY: {anomaly}
+HISTORICAL MATCH: Unavailable in rules-only mode
+RECOMMENDATION: {recommendation}
+URGENCY: {urgency}
+
+NARRATIVE:
+Rules-only assessment: the plant is producing {actual:.1f} kW against an expected {expected:.1f} kW ({performance:.1f}%). {recommendation}."""
+
+
 # ── Full Pipeline ──────────────────────────────────────────────
 def run_pipeline(
     zone_name,
@@ -148,7 +208,8 @@ def run_pipeline(
     daylight_df,
     hybrid_retriever,
     seasonal_lookup,
-    llm
+    llm,
+    historical_df=None
 ):
     """
     Full LLMSense + RAG pipeline for a given zone and window index.
@@ -174,8 +235,24 @@ def run_pipeline(
     Returns dict with all intermediate and final outputs.
     """
 
-    # Step 1 — Window stats
-    window_stats = summaries_df.iloc[window_index].to_dict()
+    # Step 1 — Window stats. Filter defensively so callers cannot combine one
+    # zone's raw telemetry with another zone's summary row.
+    if "zone" in summaries_df.columns:
+        zone_summaries = summaries_df[
+            summaries_df["zone"] == zone_name
+        ].reset_index(drop=True)
+    else:
+        zone_summaries = summaries_df.reset_index(drop=True)
+
+    if zone_summaries.empty:
+        raise ValueError(f"No window summaries found for {zone_name}")
+    if not 0 <= window_index < len(zone_summaries):
+        raise IndexError(
+            f"Window index {window_index} is out of range for {zone_name} "
+            f"(0-{len(zone_summaries) - 1})"
+        )
+
+    window_stats = zone_summaries.iloc[window_index].to_dict()
     window_start = pd.to_datetime(window_stats["window_start"])
     window_end = pd.to_datetime(window_stats["window_end"])
     month = int(window_start.month)
@@ -194,13 +271,40 @@ def run_pipeline(
         print(f"No data found for {zone_name}, window {window_index}")
         return None
 
+    if historical_df is not None:
+        anomaly_history = historical_df[
+            historical_df["zone"] == zone_name
+        ].copy()
+    else:
+        anomaly_history = zone_data
+    anomaly_analysis = analyze_window(window_data, anomaly_history)
+    recommendation_analysis = evaluate_recommendations(
+        anomaly_analysis, window_data
+    )
+
+    warnings = []
+
     # Step 3 — Edge LLM summarization
     structured_text = format_window_for_summary(window_data)
-    local_summary = get_local_summary(structured_text)
+    try:
+        local_summary = get_local_summary(structured_text)
+    except Exception as exc:
+        local_summary = structured_text
+        warnings.append(
+            "Ollama is unavailable; using the deterministic sensor summary "
+            f"instead ({type(exc).__name__})."
+        )
 
     # Step 4 — RAG retrieval
     rag_query = build_rag_query(window_stats, month)
-    rag_context = get_rag_context(rag_query, hybrid_retriever)
+    try:
+        rag_context = get_rag_context(rag_query, hybrid_retriever)
+    except Exception as exc:
+        rag_context = "Historical retrieval unavailable."
+        warnings.append(
+            "Historical retrieval failed; continuing without RAG context "
+            f"({type(exc).__name__})."
+        )
 
     # Step 5 — Seasonal expected output
     expected_output_kw = seasonal_lookup.get(month, 2000.0)
@@ -211,11 +315,32 @@ def run_pipeline(
         window_stats=window_stats,
         zone_name=zone_name,
         rag_context=rag_context,
-        expected_output_kw=expected_output_kw
+        expected_output_kw=expected_output_kw,
+        anomaly_context=format_anomaly_context(anomaly_analysis),
+        recommendation_context=format_recommendation_context(
+            recommendation_analysis
+        )
     )
 
-    # Step 7 — Cloud LLM reasoning
-    reasoning = get_cloud_reasoning(prompt, llm)
+    # Step 7 — Cloud LLM reasoning, with a deterministic operational fallback.
+    if llm is None:
+        reasoning = build_fallback_reasoning(
+            window_stats, expected_output_kw, recommendation_analysis
+        )
+        warnings.append(
+            "Groq is not configured; showing a deterministic rules-only assessment."
+        )
+    else:
+        try:
+            reasoning = get_cloud_reasoning(prompt, llm)
+        except Exception as exc:
+            reasoning = build_fallback_reasoning(
+                window_stats, expected_output_kw, recommendation_analysis
+            )
+            warnings.append(
+                "Groq request failed; showing a deterministic rules-only "
+                f"assessment ({type(exc).__name__})."
+            )
 
     return {
         "zone": zone_name,
@@ -230,7 +355,11 @@ def run_pipeline(
         "rag_query": rag_query,
         "rag_context": rag_context,
         "prompt": prompt,
-        "reasoning": reasoning
+        "reasoning": reasoning,
+        "warnings": warnings,
+        "reasoning_mode": "rules" if any("Groq" in w for w in warnings) else "ai",
+        "anomaly_analysis": anomaly_analysis,
+        "recommendation_analysis": recommendation_analysis
     }
 
 

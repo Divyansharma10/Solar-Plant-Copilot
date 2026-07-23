@@ -44,6 +44,7 @@ HOURLY_VARS = [
 
 TIMEZONE = "Asia/Kolkata"
 BASE_URL = "https://archive-api.open-meteo.com/v1/archive"
+LIVE_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
 # ── Panel & Plant Settings ─────────────────────────────────────
 TILT = 24                        # panel tilt angle degrees
